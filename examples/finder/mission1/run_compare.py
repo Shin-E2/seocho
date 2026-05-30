@@ -10,7 +10,7 @@ T1(01_vector_vs_graph_rag.ipynb)의 검색 로직을 배치용으로 옮긴 것.
     python /workspace/examples/finder/mission1/run_compare.py --per-cat 2 --ontology A
 """
 import os, sys, json, time, re, argparse
-from collections import defaultdict
+from collections import defaultdict, Counter
 from pathlib import Path
 
 ROOT = Path("/workspace")
@@ -24,8 +24,11 @@ from seocho.store.graph import Neo4jGraphStore
 
 DATASET = ROOT / "examples/finder/datasets/finder_real_3cat.json"
 OUTDIR = ROOT / ".seocho/mission1"
-ONTOLOGY_FILES = {
-    "A": ROOT / "examples/datasets/fibo_base.jsonld",  # FIBO base (T1과 동일)
+ONTOLOGY_FILES = {  # 멘토 4-arm = 온톨로지 크기 변수 (non<small<medium<large)
+    "non":    ROOT / "examples/datasets/fibo_none.jsonld",   # 1 generic class Entity (near-schemaless)
+    "small":  ROOT / "examples/datasets/fibo_minus.jsonld",  # 2: Company+FinancialMetric (수치만)
+    "medium": ROOT / "examples/datasets/fibo_base.jsonld",   # 4: +Person+Regulation
+    "large":  ROOT / "examples/datasets/fibo_plus.jsonld",   # 9: +Risk/Product/LegalIssue/Event/AccountingPolicy
 }
 
 LLM_SPEC = os.environ.get("SEOCHO_LLM", "openai/gpt-4o-mini")
@@ -109,6 +112,27 @@ def contains_match(answer, expected):
     return normalize_answer(expected) in normalize_answer(answer)
 
 
+def token_f1(answer, expected):
+    """FinDER 논문 지표 = token-level F1 (SQuAD 방식, multiset 교집합)."""
+    pred = normalize_answer(answer).split()
+    gold = normalize_answer(expected).split()
+    if not pred or not gold:
+        return 0.0
+    overlap = sum((Counter(pred) & Counter(gold)).values())
+    if overlap == 0:
+        return 0.0
+    prec, rec = overlap / len(pred), overlap / len(gold)
+    return 2 * prec * rec / (prec + rec)
+
+
+def question_type(c):
+    """질문유형 (graph 약세 진단축): 수치-연산 / 수치-검색 / 질적."""
+    if c.reasoning_type in ("Subtract", "Division", "Addition", "Multiplication"):
+        return "numeric-compute"
+    nums = len(re.findall(r"\d", c.expected_answer or ""))
+    return "numeric-lookup" if nums >= 4 else "qualitative"
+
+
 def judge(llm, question, gold, cand):
     try:
         txt = llm.complete(system=JUDGE_SYSTEM,
@@ -135,9 +159,21 @@ def pick(cases, per_cat):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--per-cat", type=int, default=0, help="카테고리당 케이스 수(0=전부)")
-    ap.add_argument("--ontology", default="A", choices=list(ONTOLOGY_FILES))
+    ap.add_argument("--ontology", default="medium", choices=list(ONTOLOGY_FILES))
     ap.add_argument("--k", type=int, default=3)
     args = ap.parse_args()
+
+    # Opik 트레이싱 (멘토 필수: indexing 로그 기록). project=이름-날짜-모델, ws=seocho.
+    import datetime
+    os.environ.setdefault("SEOCHO_TRACE_BACKEND", "opik")
+    os.environ.setdefault("OPIK_WORKSPACE", "seocho")
+    os.environ["OPIK_PROJECT_NAME"] = "shinhyeji-openai"  # 사용자 기존 Opik 프로젝트 재사용 (seocho ws)
+    try:
+        from seocho.tracing import configure_tracing_from_env
+        _opik = configure_tracing_from_env()
+        print(f"[opik] {'on' if _opik else 'off'}: ws=seocho project={os.environ['OPIK_PROJECT_NAME']} arm={args.ontology}")
+    except Exception as e:
+        print(f"[opik] off: {e}")
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
     cases = pick(load_finder_cases(DATASET), args.per_cat)
@@ -173,6 +209,7 @@ def main():
     # 3) compare + judge
     rows = []
     for i, c in enumerate(cases, 1):
+        g_ctx = graph_context(gs, workspace, c.question)  # 검색 성공률 측정 (결정적, judge 무관)
         va = ans_vector(vector_store, llm, c.question, args.k)
         ga = ans_graph(gs, workspace, llm, c.question)
         ha = ans_hybrid(vector_store, gs, workspace, llm, c.question, args.k)
@@ -181,10 +218,12 @@ def main():
         hs, hv = judge(llm, c.question, c.expected_answer, ha)
         rows.append({
             "case_id": c.case_id, "category": c.category, "reasoning_type": c.reasoning_type,
+            "question_type": question_type(c),
             "question": c.question, "expected": c.expected_answer,
-            "vector": {"answer": va, "contains": contains_match(va, c.expected_answer), "judge": vs, "verdict": vv},
-            "graph": {"answer": ga, "contains": contains_match(ga, c.expected_answer), "judge": gsc, "verdict": gv},
-            "hybrid": {"answer": ha, "contains": contains_match(ha, c.expected_answer), "judge": hs, "verdict": hv},
+            "vector": {"answer": va, "contains": contains_match(va, c.expected_answer), "f1": round(token_f1(va, c.expected_answer), 3), "judge": vs, "verdict": vv},
+            "graph": {"answer": ga, "contains": contains_match(ga, c.expected_answer), "f1": round(token_f1(ga, c.expected_answer), 3), "judge": gsc, "verdict": gv,
+                      "evidence_len": len(g_ctx), "has_evidence": bool(g_ctx.strip())},
+            "hybrid": {"answer": ha, "contains": contains_match(ha, c.expected_answer), "f1": round(token_f1(ha, c.expected_answer), 3), "judge": hs, "verdict": hv},
         })
         if i % 5 == 0:
             print(f"  compared {i}/{len(cases)}")
@@ -193,8 +232,9 @@ def main():
     def agg(mode):
         n = len(rows)
         cont = sum(1 for r in rows if r[mode]["contains"]) / n
+        f1 = sum(r[mode]["f1"] for r in rows) / n
         jsc = sum(r[mode]["judge"] for r in rows) / n
-        return {"contains_rate": round(cont, 3), "avg_judge": round(jsc, 3)}
+        return {"contains_rate": round(cont, 3), "avg_token_f1": round(f1, 3), "avg_judge": round(jsc, 3)}
 
     summary = {m: agg(m) for m in ("vector", "graph", "hybrid")}
     # wins by judge score
@@ -210,22 +250,53 @@ def main():
         for m in ("vector", "graph", "hybrid"):
             by_cat[r["category"]][m].append(r[m]["judge"])
     cat_summary = {cat: {m: round(sum(v)/len(v), 3) for m, v in d.items()} for cat, d in by_cat.items()}
+    # per-reasoning_type avg judge (graph 약세가 산술/검색 어디서 오나 = novelty 2층 진단)
+    by_rt = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        for m in ("vector", "graph", "hybrid"):
+            by_rt[r["reasoning_type"]][m].append(r[m]["judge"])
+    rt_summary = {rt: {"n": len(d["vector"]),
+                       **{m: round(sum(v)/len(v), 3) for m, v in d.items()}}
+                  for rt, d in by_rt.items()}
+    # 질문유형별 judge + graph 검색 성공률 (핵심 가설: 온톨로지 크기 × 질문유형)
+    by_qt = defaultdict(lambda: {"n": 0, "vector": [], "graph": [], "hybrid": [], "g_evid": []})
+    for r in rows:
+        qt = r["question_type"]; by_qt[qt]["n"] += 1
+        for m in ("vector", "graph", "hybrid"):
+            by_qt[qt][m].append(r[m]["judge"])
+        by_qt[qt]["g_evid"].append(1 if r["graph"]["has_evidence"] else 0)
+    qt_summary = {qt: {"n": d["n"],
+                       "vector": round(sum(d["vector"])/d["n"], 3),
+                       "graph": round(sum(d["graph"])/d["n"], 3),
+                       "hybrid": round(sum(d["hybrid"])/d["n"], 3),
+                       "graph_evidence_rate": round(sum(d["g_evid"])/d["n"], 3)}
+                  for qt, d in by_qt.items()}
+    g_evid_rate = round(sum(1 for r in rows if r["graph"]["has_evidence"]) / len(rows), 3)
 
     out = {"n": len(rows), "ontology": args.ontology, "model": f"{LLM_PROVIDER}/{LLM_MODEL}",
-           "summary": summary, "graph_vs_vector_wins": wins, "by_category": cat_summary, "rows": rows}
+           "summary": summary, "graph_evidence_rate": g_evid_rate,
+           "graph_vs_vector_wins": wins, "by_category": cat_summary,
+           "by_reasoning_type": rt_summary, "by_question_type": qt_summary, "rows": rows}
     fp = OUTDIR / f"compare_{args.ontology}_n{len(rows)}.json"
     fp.write_text(json.dumps(out, ensure_ascii=False, indent=2))
 
     print("\n" + "=" * 56)
     print(f"  RESULT (n={len(rows)}, ontology={args.ontology})")
     print("=" * 56)
-    print(f"{'mode':<8}{'contains':>10}{'avg_judge':>12}")
+    print(f"{'mode':<8}{'contains':>10}{'token_f1':>10}{'avg_judge':>12}")
     for m in ("vector", "graph", "hybrid"):
-        print(f"{m:<8}{summary[m]['contains_rate']:>10}{summary[m]['avg_judge']:>12}")
+        print(f"{m:<8}{summary[m]['contains_rate']:>10}{summary[m]['avg_token_f1']:>10}{summary[m]['avg_judge']:>12}")
     print(f"\nGraph vs Vector (judge): graph {wins['graph']} / vector {wins['vector']} / tie {wins['tie']}")
     print("\nby category (avg_judge):")
     for cat, d in cat_summary.items():
         print(f"  {cat:<18} v={d['vector']} g={d['graph']} h={d['hybrid']}")
+    print("\nby reasoning_type (avg_judge, g-v = graph 손실):")
+    for rt, d in sorted(rt_summary.items(), key=lambda x: -x[1]["n"]):
+        print(f"  {rt:<14} n={d['n']:<3} v={d['vector']} g={d['graph']} h={d['hybrid']} g-v={round(d['graph']-d['vector'],3):+}")
+    print(f"\ngraph evidence rate (검색 비-빈 성공률): {g_evid_rate}")
+    print("by question_type (avg_judge + graph 검색성공):")
+    for qt, d in sorted(qt_summary.items(), key=lambda x: -x[1]["n"]):
+        print(f"  {qt:<16} n={d['n']:<3} v={d['vector']} g={d['graph']} h={d['hybrid']} g_evid={d['graph_evidence_rate']}")
     print(f"\nsaved -> {fp}")
 
 

@@ -1,0 +1,39 @@
+{
+  "@context": {
+    "schema": "https://schema.org/",
+    "skos": "http://www.w3.org/2004/02/skos/core#",
+    "sh": "http://www.w3.org/ns/shacl#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "seocho": "https://seocho.dev/ontology/"
+  },
+  "@id": "seocho:fibo_none",
+  "@type": "seocho:Ontology",
+  "name": "fibo_none",
+  "version": "1.0.0",
+  "description": "No-ontology baseline (near-schemaless): generic single-class entity/relation extraction without domain constraints. Mentor 'non-ontology = basic entity extraction & linking'.",
+  "nodes": {
+    "Entity": {
+      "@type": "seocho:NodeType",
+      "description": "Any named entity mentioned in the text: company, person, product, segment, strategy, risk, financial figure, policy, or concept.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "unique": true
+        },
+        "type": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "relationships": {
+    "RELATED_TO": {
+      "source": "Entity",
+      "target": "Entity",
+      "description": "Any relationship between two entities (reports, owns, competes, depends on, describes, etc.)"
+    }
+  }
+}
